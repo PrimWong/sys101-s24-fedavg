@@ -3,6 +3,9 @@ use clap::{Parser, ValueEnum};
 use candle_core::{DType, Result, Tensor, D, IndexOp};
 use candle_nn::{loss, ops, Linear, Module, Optimizer, VarBuilder, VarMap, SGD};
 
+use std::sync::mpsc;
+use std::thread;
+
 const IMAGE_DIM: usize = 784;
 const LABELS: usize = 10;
 
@@ -82,32 +85,46 @@ fn training_loop<M: Model>(
 ) -> anyhow::Result<()> {
     let dev = candle_core::Device::cuda_if_available(0)?;
 
+    let (tx, rx) = mpsc::channel(); // Create a channel for sending training results
+
     let train_labels = m.train_labels.to_dtype(DType::U32)?.to_device(&dev)?;
     let train_images = m.train_images.to_device(&dev)?;
     let test_images = m.test_images.to_device(&dev)?;
     let test_labels = m.test_labels.to_dtype(DType::U32)?.to_device(&dev)?;
 
     // Train 1st model
-    let varmap = VarMap::new();
-    let vs = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
-    let model_1 = model_train(M::new(vs.clone())?, &test_images.i(..test_images.shape().dims()[0]/2)?,
+    let tx1 = tx.clone();
+    thread::spawn(move || {
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let result_model_1 = model_train(M::new(vs.clone())?, &test_images.i(..test_images.shape().dims()[0]/2)?,
                               &test_labels.i(..test_labels.shape().dims()[0]/2)?,
                               &train_images.i(..train_images.shape().dims()[0]/2)?,
                               &train_labels.i(..train_labels.shape().dims()[0]/2)?,
                               SGD::new(varmap.all_vars(), args.learning_rate)?, args.epochs)?;
+        tx1.send(result_model_1).unwrap();
+    });
 
     // Train 2nd model
-    let varmap2 = VarMap::new();
-    let vs2 = VarBuilder::from_varmap(&varmap2, DType::F32, &dev);
-    let model_2 = model_train(M::new(vs2.clone())?,
-                              &test_images.i(test_images.shape().dims()[0]/2..)?,
-                              &test_labels.i(test_labels.shape().dims()[0]/2..)?,
-                              &train_images.i(train_images.shape().dims()[0]/2..)?,
-                              &train_labels.i(train_labels.shape().dims()[0]/2..)?,
-                              SGD::new(varmap2.all_vars(), args.learning_rate)?, args.epochs)?;
+    let tx2 = tx.clone();
+    thread::spawn(move || {
+        let varmap2 = VarMap::new();
+        let vs2 = VarBuilder::from_varmap(&varmap2, DType::F32, &dev);
+        let result_model_2 = model_train(M::new(vs2.clone())?,
+                                &test_images.i(test_images.shape().dims()[0]/2..)?,
+                                &test_labels.i(test_labels.shape().dims()[0]/2..)?,
+                                &train_images.i(train_images.shape().dims()[0]/2..)?,
+                                &train_labels.i(train_labels.shape().dims()[0]/2..)?,
+                                SGD::new(varmap2.all_vars(), args.learning_rate)?, args.epochs)?;
+        tx2.send(result_model_2).unwrap();
+    });
+
+    let model_1 = rx.recv().unwrap()?;
+    let model_2 = rx.recv().unwrap()?;
 
     // Get the average model
-    let model = Linear::new(((model_1.weight()?+ model_2.weight()?)?/2.0)?, Some(((model_1.bias().unwrap()+ model_2.bias().unwrap())?/2.0)?));
+    let model = Linear::new(((model_1.weight()?+ model_2.weight()?)?/2.0)?, Some(((model_1.bias().u
+    nwrap()+ model_2.bias().unwrap())?/2.0)?));
     let test_logits = model.forward(&test_images)?;
     let sum_ok = test_logits
         .argmax(D::Minus1)?
